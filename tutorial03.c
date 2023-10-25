@@ -192,7 +192,9 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
     len1 = audio_buf_size - audio_buf_index;
     if(len1 > len)
       len1 = len;
-    memcpy(stream, (uint8_t *)audio_buf + audio_buf_index, len1);
+    // memcpy(stream, (uint8_t *)audio_buf + audio_buf_index, len1);
+    // SDL_MIX_MAXVOLUME 可用于音量控制
+    SDL_MixAudio(stream, (uint8_t *)audio_buf + audio_buf_index, len1, SDL_MIX_MAXVOLUME);
     len -= len1;
     stream += len1;
     audio_buf_index += len1;
@@ -205,6 +207,7 @@ int main(int argc, char *argv[]) {
   AVCodecContext  *pCodecCtx = NULL;
   AVCodec         *pCodec = NULL;
   AVFrame         *pFrame = NULL; 
+  AVFrame         *pFrameYUV = NULL;
   AVPacket        packet;
   int             frameFinished;
   //float           aspect_ratio;
@@ -212,8 +215,11 @@ int main(int argc, char *argv[]) {
   AVCodecContext  *aCodecCtx = NULL;
   AVCodec         *aCodec = NULL;
 
-  SDL_Overlay     *bmp = NULL;
-  SDL_Surface     *screen = NULL;
+  // SDL_Overlay     *bmp = NULL;
+  // SDL_Surface     *screen = NULL;
+  SDL_Window      *window;
+  SDL_Renderer    *renderer;
+  SDL_Texture     *texture;
   SDL_Rect        rect;
   SDL_Event       event;
   SDL_AudioSpec   wanted_spec, spec;
@@ -303,24 +309,40 @@ int main(int argc, char *argv[]) {
   
   // Allocate video frame
   pFrame=av_frame_alloc();
+  pFrameYUV=av_frame_alloc();
+
+  av_image_fill_arrays(
+      pFrameYUV->data,
+      pFrameYUV->linesize,
+      (uint8_t const *const *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height, 1)),
+      AV_PIX_FMT_YUV420P,
+      pCodecCtx->width,
+      pCodecCtx->height,
+      1);
 
   // Make a screen to put our video
 
-#ifndef __DARWIN__
-        screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
-#else
-        screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 24, 0);
-#endif
-  if(!screen) {
-    fprintf(stderr, "SDL: could not set video mode - exiting\n");
-    exit(1);
+  // #ifndef __DARWIN__
+  //         screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
+  // #else
+  //         screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 24, 0);
+  // #endif
+  //   if(!screen) {
+  //     fprintf(stderr, "SDL: could not set video mode - exiting\n");
+  //     exit(1);
+  //   }
+  window = SDL_CreateWindow("tutorial03", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, pCodecCtx->width, pCodecCtx->height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+  if(!window) {
+      fprintf(stderr, "SDL: could not create SDL window - %s exiting\n", SDL_GetError());
+      exit(1);
   }
-  
+  renderer = SDL_CreateRenderer(window, -1, 0);
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, pCodecCtx->width, pCodecCtx->height);
   // Allocate a place to put our YUV image on that screen
-  bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
-				 pCodecCtx->height,
-				 SDL_YV12_OVERLAY,
-				 screen);
+  // bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
+	// 			 pCodecCtx->height,
+	// 			 SDL_YV12_OVERLAY,
+	// 			 screen);
   sws_ctx =
     sws_getContext
     (
@@ -329,7 +351,7 @@ int main(int argc, char *argv[]) {
         pCodecCtx->pix_fmt,
         pCodecCtx->width,
         pCodecCtx->height,
-        PIX_FMT_YUV420P,
+        AV_PIX_FMT_YUV420P,
         SWS_BILINEAR,
         NULL,
         NULL,
@@ -348,16 +370,16 @@ int main(int argc, char *argv[]) {
       
       // Did we get a video frame?
       if(frameFinished) {
-	SDL_LockYUVOverlay(bmp);
+	// SDL_LockYUVOverlay(bmp);
 
-	AVPicture pict;
-	pict.data[0] = bmp->pixels[0];
-	pict.data[1] = bmp->pixels[2];
-	pict.data[2] = bmp->pixels[1];
+	// AVPicture pict;
+	// pict.data[0] = bmp->pixels[0];
+	// pict.data[1] = bmp->pixels[2];
+	// pict.data[2] = bmp->pixels[1];
 
-	pict.linesize[0] = bmp->pitches[0];
-	pict.linesize[1] = bmp->pitches[2];
-	pict.linesize[2] = bmp->pitches[1];
+	// pict.linesize[0] = bmp->pitches[0];
+	// pict.linesize[1] = bmp->pitches[2];
+	// pict.linesize[2] = bmp->pitches[1];
 
 	// Convert the image into YUV format that SDL uses
     sws_scale
@@ -367,17 +389,21 @@ int main(int argc, char *argv[]) {
         pFrame->linesize, 
         0,
         pCodecCtx->height,
-        pict.data,
-        pict.linesize
+        pFrameYUV->data,
+        pFrameYUV->linesize
     );
 	
-	SDL_UnlockYUVOverlay(bmp);
+	// SDL_UnlockYUVOverlay(bmp);
 	
 	rect.x = 0;
 	rect.y = 0;
 	rect.w = pCodecCtx->width;
 	rect.h = pCodecCtx->height;
-	SDL_DisplayYUVOverlay(bmp, &rect);
+	// SDL_DisplayYUVOverlay(bmp, &rect);
+  SDL_UpdateTexture(texture, NULL, pFrameYUV->data[0], pFrameYUV->linesize[0]);
+  SDL_RenderClear(renderer);
+  SDL_RenderCopy(renderer, texture, NULL, &rect);
+                SDL_RenderPresent(renderer);
 	av_free_packet(&packet);
       }
     } else if(packet.stream_index==audioStream) {
@@ -399,8 +425,12 @@ int main(int argc, char *argv[]) {
 
   }
 
+  sws_freeContext(sws_ctx);
+
   // Free the YUV frame
   av_free(pFrame);
+
+  av_free(pFrameYUV);
   
   // Close the codec
   avcodec_close(pCodecCtx);

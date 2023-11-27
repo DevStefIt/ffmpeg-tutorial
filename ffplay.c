@@ -20,6 +20,13 @@
 
 #define AUDIO_BUFFER_SIZE 65536
 
+#define WINDOW_ORIG_X 100
+#define WINDOW_ORIG_Y 100
+#define WINDOW_WIDTH 720
+#define WINDOW_HEIGHT 480
+
+#define PICTURE_QUEUE_SIZE 1
+
 typedef struct MediaContainer
 {
     // 格式上下文
@@ -58,12 +65,41 @@ typedef struct PacketQueue
     AVPacketList *first_packet;
     AVPacketList *lasst_packet;
 
-    int num_of_packts;
+    int num_of_packets;
     int num_of_bytes;
 
     SDL_mutex *mutex;
     SDL_cond *cond;
-} PackerQueue;
+} PacketQueue;
+
+typedef struct VideoDevice
+{
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+} VideoDevice;
+
+typedef struct VideoRescale
+{
+    struct SwsContext *sws_ctx;
+} VideoRescale;
+
+typedef struct Picture
+{
+    SDL_Texture *texture;
+    SDL_mutex *mutex;
+    int width;
+    int height;
+    double pts;
+}Picture;
+typedef struct PictureQueue
+{
+    int size;
+    int wr_index;
+    int rd_index;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+    Picture pictures[PICTURE_QUEUE_SIZE];
+}PictureQueue;
 
 // 视频宽高比
 static double aspect_ratio = 0.0;
@@ -81,11 +117,14 @@ int8_t audio_buffer[AUDIO_BUFFER_SIZE];
 static unsigned int audio_buffer_index = 0;
 static unsigned int audio_data_length = 0;
 
-static PackerQueue audio_queue;
-static PackerQueue video_queue;
+static PacketQueue audio_queue;
+static PacketQueue video_queue;
 
 static double audio_clock = 0.0;
 static double video_clock = 0.0;
+
+static VideoDevice video_device;
+static VideoRescale video_rescale;
 
 // 初始化媒体容器
 static bool init_media_container(MediaContainer *media_container, const char *filename)
@@ -362,10 +401,205 @@ static bool init_audio_device(AudioDevice *device)
     audio_spec.freq = SAMPLE_RATE;
     audio_spec.format = AUDIO_S16SYS;
     audio_spec.channels = CHANNELS_NUMBER;
+    audio_spec.silence = 0;
     audio_spec.samples = NUM_OF_SAMPLES;
     audio_spec.callback = audio_callback;
     audio_spec.userdata = NULL;
+
+    int audio_device_id = SDL_OpenAudioDevice(NULL, 0, &audio_spec, &device->audio_spec, 0);
+    if (audio_device_id == 0)
+    {
+        fprintf(stderr, "SDL_OpenAudioDevice() error: %s\n", SDL_GetError());
+        return false;
+    }
+    device->id = audio_device_id;
+    return true;
 }
+
+static void release_audio_device(AudioDevice *device)
+{
+    assert(device != NULL);
+    if (device->id != 0)
+        SDL_CLoseAudioDevice(device->id);
+    SDL_memset(&device->audio_spec, 0, sizeof(device->audio_spec));
+    device->id = -1;
+}
+
+static bool init_audio_resample(AudioResamlpe *resample,
+                                int in_channel_count, int out_channel_count,
+                                int in_sample_format, int out_sample_format,
+                                int in_channel_layout, int out_channel_layout,
+                                int in_sample_rate, int out_sample_rate)
+{
+    assert(resample != NULL);
+    AVFrame *frame = av_frame_alloc();
+    if (!frame)
+    {
+        fprintf(stderr, "Could not allocate audio frame!\n");
+        return false;
+    }
+
+    struct SwrContext *swr_ctx = swr_alloc();
+    if (!swr_ctx)
+    {
+        fprint(stderr, "Could not allocate resample context!\n");
+        av_frame_free(&frame);
+        return false;
+    }
+
+    av_opt_set_int(swr_ctx, "in_channel_count", in_channel_count, 0);
+    av_opt_set_int(swr_ctx, "out_channel_count", in_channel_count, 0);
+    av_opt_set_int(swr_ctx, "in_sample_fmt", in_sample_format, 0);
+    av_opt_set_int(swr_ctx, "out_sample_fmt", out_sample_format, 0);
+    av_opt_set_int(swr_ctx, "in_channel_layout", in_channel_layout, 0);
+    av_opt_set_int(swr_ctx, "out_channel_layout", out_channel_layout, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate", in_sample_rate, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate", out_sample_rate, 0);
+
+    swr_init(swr_ctx);
+
+    resample->frame = frame;
+    resample->swr_ctx = swr_ctx;
+
+    return true;
+}
+
+static void release_audio_resample(AudioResamlpe *resample)
+{
+    assert(resample != NULL);
+    if (resample->frame != NULL)
+        av_frame_free(&resample->frame);
+    resample->frame = NULL;
+    if (resample->swr_ctx != NULL)
+        swr_free(&resample->swr_ctx);
+    resample->swr_ctx = NULL;
+}
+
+static bool init_video_device(VideoDevice *device, int xorig, int yorig, int width, int height)
+{
+    assert(device != NULL);
+    SDL_Window *window = NULL;
+    SDL_Renderer *renderer = NULL;
+
+    window = SDL_CreateWindow("player", xorig, yorig, width, height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer)
+    {
+        fprintf(stderr, "SDL_CreateRenderer() error:%s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        return false;
+    }
+    device->window = window;
+    device->renderer = renderer;
+    return true;
+}
+
+static void release_video_device(VideoDevice *device)
+{
+    assert(device != NULL);
+    if (device->renderer != NULL)
+        SDL_DestoryRenderer(device->renderer);
+    device->renderer = NULL;
+
+    if (device->window != NULL)
+        SDL_DertoryWindow(device->window);
+    device->window = NULL;
+}
+
+static bool init_video_rescale(VideoRescale *rescale,
+                               int in_width, int in_height, int in_pix_format,
+                               int out_width, int out_height, int out_pix_format)
+{
+    assert(rescale != NULL);
+    struct SwsContext *sws_ctx = sws_getContext(in_width, in_height, in_pix_format,
+                                                out_width, out_height, out_pix_format,
+                                                SWS_BILINEAR, NULL, NULL, NULL);
+    if (!sws_ctx)
+    {
+        fprintf(stderr, "Could not allocate scale context!\n");
+        return false;
+    }
+    rescale->sws_ctx = sws_ctx;
+    return true;
+}
+
+static void release_video_rescale(VideoRescale *rescale)
+{
+    assert(rescale != NULL);
+    if (rescale->sws_ctx != NULL)
+        sws_freeDontext(rescale->sws_ctx);
+    rescale->sws_ctx = NULL;
+}
+
+static bool packet_queue_init(PacketQueue *queue)
+{
+    assert(queue!=NULL);
+    
+    queue->first_packet =NULL;
+    queue->lasst_packet=NULL;
+    queue->num_of_packets = 0;
+    queue->num_of_bytes = 0;
+
+    queue->mutex = SDL_CreateMutex();
+    if(!queue->mutex)
+    {
+        fprintf(stderr,"SDL_CreateMutex() error:%s\n",SDL_GetError());
+        return false;
+    }
+    queue->cond = SDL_CreateCond();
+    if(!queue->cond)
+    {
+        fprintf(stderr,"SDL_CreateCond() error:%s\n",SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+static bool picture_queue_init(PictureQueue *queue)
+{
+    assert(queue!=NULL);
+
+    queue->size = 0;
+    queue->wr_index=0;
+    queue->rd_index=0;
+
+    queue->mutex=SDL_CreateMutex();
+    if(!queue->cond)
+    {
+        fprintf(stderr,"SDL_CreateCond() error:%s\n",SDL_GetError());
+        return false;
+    }
+    queue->cond = SDL_CreateCond();
+    if (!queue->cond)
+    {
+        fprintf(stderr, "SDL_CreateCond() error: %s\n", SDL_GetError());
+        SDL_DestroyMutex(queue->mutex);
+        return false;
+    }
+    int i = 0;
+    Picture *picture = &queue->pictures[0];
+    for(;i<PICTURE_QUEUE_SIZE;i++,picture++)
+    {
+        picture->texture = NULL;
+        picture->width = 0;
+        picture->height = 0;
+        picture->mutex = SDL_CreateMutex();
+        if (!picture->mutex)
+        {
+            fprintf(stderr, "SDL_CreateMutex() error: %s\n", SDL_GetError());
+            while (i-- >= 0)
+            {
+                picture--;
+                if (picture->mutex)
+                    SDL_DestroyMutex(picture->mutex);
+                picture->mutex = NULL;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -413,6 +647,44 @@ int main(int argc, char *argv[])
         fprintf(stderr, "init_video_decoder() failed!\n");
         goto end;
     }
+    if (!init_audio_device(&audio_device))
+    {
+        fprintf(stderr, "init_audio_device() failed!\n");
+        goto end;
+    }
+    if (!init_audio_resample(&audio_resample,
+                             audio_decoder.codec_ctx->channels, audio_device.audio_spec.channels,
+                             audio_decoder.codec_ctx->sample_fmt, AV_SAMPLE_FMT_S16,
+                             audio_decoder.codec_ctx->channel_layout, AV_CH_LAYOUT_STEREO,
+                             audio_decoder.codec_ctx->sample_rate, audio_device.audio_spec.freq))
+    {
+        fprintf(stderr, "init_audio_resample() failed!\n");
+        goto end;
+    }
+    if (!init_video_device(&video_device, WINDOW_ORIG_X, WINDOW_ORIG_Y, WINDOW_WIDTH, WINDOW_HEIGHT))
+    {
+        fprintf(stderr, "init_video_device() failed!\n");
+        goto end;
+    }
+    if (!init_video_rescale(&video_rescale,
+                            video_decoder.codec_ctx->width, video_decoder.codec_ctx->height, video_decoder.codec_ctx->pix_fmt,
+                            WINDOW_WIDTH, WINDOW_HEIGHT, AV_PIX_FMT_RGB24))
+    {
+        fprintf(stderr, "init_video_rescale() failed!\n");
+        goto end;
+    }
+    if (!packet_queue_init(&audio_queue))
+    {
+        fprintf(stderr, "Couldn't initialize audio queue!\n");
+        goto end;
+    }
+
+    if (!packet_queue_init(&video_queue))
+    {
+        fprintf(stderr, "Couldn't initialize video queue!\n");
+        goto end;
+    }
+
 end:
     // 退出SDL
     SDL_Quit();

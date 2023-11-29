@@ -15,6 +15,9 @@
 #define SAMPLE_RATE 48000
 #define CHANNELS_NUMBER 2
 
+#define MAX_AUDIOQ_SIZE (5 * 16 * 1024)
+#define MAX_VIDEOQ_SIZE (5 * 256 * 1024)
+
 #define BYTES_PER_SAMPLE 2
 #define NUM_OF_SAMPLES 2048
 
@@ -26,6 +29,9 @@
 #define WINDOW_HEIGHT 480
 
 #define PICTURE_QUEUE_SIZE 1
+
+#define REFRESH_SCREEN_EVENT (SDL_USEREVENT + 1)
+#define QUIT_EVENT (SDL_USEREVENT + 2)
 
 typedef struct MediaContainer
 {
@@ -63,7 +69,7 @@ typedef struct AudioResamlpe
 typedef struct PacketQueue
 {
     AVPacketList *first_packet;
-    AVPacketList *lasst_packet;
+    AVPacketList *last_packet;
 
     int num_of_packets;
     int num_of_bytes;
@@ -90,7 +96,7 @@ typedef struct Picture
     int width;
     int height;
     double pts;
-}Picture;
+} Picture;
 typedef struct PictureQueue
 {
     int size;
@@ -99,7 +105,9 @@ typedef struct PictureQueue
     SDL_mutex *mutex;
     SDL_cond *cond;
     Picture pictures[PICTURE_QUEUE_SIZE];
-}PictureQueue;
+} PictureQueue;
+
+static int finished = 0;
 
 // 视频宽高比
 static double aspect_ratio = 0.0;
@@ -119,12 +127,20 @@ static unsigned int audio_data_length = 0;
 
 static PacketQueue audio_queue;
 static PacketQueue video_queue;
+static PictureQueue picture_queue;
 
 static double audio_clock = 0.0;
 static double video_clock = 0.0;
 
 static VideoDevice video_device;
 static VideoRescale video_rescale;
+
+static double frame_last_delay = 0.0;
+static double frame_last_pts = 0.0;
+static double frame_timer = 0.0;
+
+static SDL_Thread *parse_container_thread = NULL;
+static SDL_Thread *decode_video_thread = NULL;
 
 // 初始化媒体容器
 static bool init_media_container(MediaContainer *media_container, const char *filename)
@@ -533,23 +549,23 @@ static void release_video_rescale(VideoRescale *rescale)
 
 static bool packet_queue_init(PacketQueue *queue)
 {
-    assert(queue!=NULL);
-    
-    queue->first_packet =NULL;
-    queue->lasst_packet=NULL;
+    assert(queue != NULL);
+
+    queue->first_packet = NULL;
+    queue->last_packet = NULL;
     queue->num_of_packets = 0;
     queue->num_of_bytes = 0;
 
     queue->mutex = SDL_CreateMutex();
-    if(!queue->mutex)
+    if (!queue->mutex)
     {
-        fprintf(stderr,"SDL_CreateMutex() error:%s\n",SDL_GetError());
+        fprintf(stderr, "SDL_CreateMutex() error:%s\n", SDL_GetError());
         return false;
     }
     queue->cond = SDL_CreateCond();
-    if(!queue->cond)
+    if (!queue->cond)
     {
-        fprintf(stderr,"SDL_CreateCond() error:%s\n",SDL_GetError());
+        fprintf(stderr, "SDL_CreateCond() error:%s\n", SDL_GetError());
         return false;
     }
     return true;
@@ -557,16 +573,16 @@ static bool packet_queue_init(PacketQueue *queue)
 
 static bool picture_queue_init(PictureQueue *queue)
 {
-    assert(queue!=NULL);
+    assert(queue != NULL);
 
     queue->size = 0;
-    queue->wr_index=0;
-    queue->rd_index=0;
+    queue->wr_index = 0;
+    queue->rd_index = 0;
 
-    queue->mutex=SDL_CreateMutex();
-    if(!queue->cond)
+    queue->mutex = SDL_CreateMutex();
+    if (!queue->cond)
     {
-        fprintf(stderr,"SDL_CreateCond() error:%s\n",SDL_GetError());
+        fprintf(stderr, "SDL_CreateCond() error:%s\n", SDL_GetError());
         return false;
     }
     queue->cond = SDL_CreateCond();
@@ -578,7 +594,7 @@ static bool picture_queue_init(PictureQueue *queue)
     }
     int i = 0;
     Picture *picture = &queue->pictures[0];
-    for(;i<PICTURE_QUEUE_SIZE;i++,picture++)
+    for (; i < PICTURE_QUEUE_SIZE; i++, picture++)
     {
         picture->texture = NULL;
         picture->width = 0;
@@ -600,6 +616,115 @@ static bool picture_queue_init(PictureQueue *queue)
     return true;
 }
 
+static bool packet_queue_init(PacketQueue *queue, const AVPacket *packet)
+{
+    assert(queue != NULL);
+
+    AVPacketList *pktl = av_malloc(sizeof(AVPacketList));
+    if (!pktl)
+    {
+        fprintf(stderr, "Could not callocate memory to AVPackerlist!\n");
+        return false;
+    }
+
+    pktl->next = NULL;
+
+    if (SDL_LockMutex(queue->mutex) != 0)
+    {
+        fprintf(stderr, "SDL_LockMutex() error: %s\n", SDL_GetError());
+        av_free(pktl);
+        return false;
+    }
+    pktl->pkt = *packet;
+
+    if (!queue->last_packet)
+        queue->first_packet = pktl; // 队列为空时
+    else
+        queue->last_packet->next = pktl; // 队列不为空时
+
+    // 更新queue
+    queue->last_packet = pktl;
+    queue->num_of_packets++;
+    queue->num_of_bytes += pktl->pkt.size;
+
+    if (SDL_CondSignal(queue->cond) != 0)
+    {
+        fprintf(stderr, "SDL_CondSignal() error: %s\n", SDL_GetError());
+        return false;
+    }
+
+    if (SDL_UnlockMutex(queue->mutex) != 0)
+    {
+        fprintf(stderr, "SDL_UnlockMutex() error: %s\n", SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+static uint32_t on_refresh_screen_timer(uint32_t interval, void *param)
+{
+    SDL_Event event;
+    event.type = REFRESH_SCREEN_EVENT;
+
+    if (SDL_PushEvent(&event) < 0)
+        fprintf(stderr, "SDL_PushEvent() failed: %s\n", SDL_GetError());
+
+    return 0; // 返回0表示定时器不再触发，如果返回非零值，则定时器将在指定的毫秒间隔后再次触发
+}
+
+static void schedule_screen_refresh(uint32_t delay_ms)
+{
+    SDL_AddTimer(delay_ms, on_refresh_screen_timer, NULL);
+}
+
+static int parse_container(void *userdata)
+{
+    AVPacket packet;
+    SDL_Event event;
+
+    av_init_packet(&packet);
+    packet.data = NULL;
+    packet.size = 0;
+
+    while (!finished && av_read_frame(media_container.format_ctx, &packet) >= 0)
+    {
+        if (audio_queue.num_of_bytes > MAX_AUDIOQ_SIZE || video_queue.num_of_bytes > MAX_VIDEOQ_SIZE)
+        {
+            SDL_Delay(10);
+        }
+        if (packet.stream_index == media_container.video_stream_idx) // 视频packet
+        {
+            if (!packet_queue_put(&video_queue, &packet))
+            {
+                fprintf(stderr, "Could not put video packet!\n");
+                av_packet_unref(&packet);
+                goto parse_fail;
+            }
+        }
+        else if (packet.stream_index == media_container.audio_stream_idx)
+        {
+            if (!packet_queue_put(&audio_queue, &packet))
+            {
+                fprintf(stderr, "Could not put audio packet!\n");
+                av_packet_unref(&packet);
+                goto parse_fail;
+            }
+            if (packet.pts != AV_NOPTS_VALUE)
+                audio_clock = av_q2d(media_container.audio_stream->time_base) * packet.pts;
+        }
+        else
+        {
+            av_packet_unref(&packet);
+        }
+    }
+    goto parse_end;
+
+parse_fail:
+    event.type = QUIT_EVENT;
+
+parse_end:
+    return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -684,6 +809,18 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Couldn't initialize video queue!\n");
         goto end;
     }
+    if (!picture_queue_init(&picture_queue))
+    {
+        fprintf(stderr, "Couldn't initialize pictures queue!\n");
+        goto end;
+    }
+
+    frame_last_delay = 40e-3;
+    frame_timer = (double)av_gettime() / 1000000.0;
+
+    schedule_screen_refresh(40);
+
+    parse_container_thread = SDL_CreateThread(parse_container, "parse container", NULL);
 
 end:
     // 退出SDL

@@ -60,11 +60,11 @@ typedef struct AudioDevice
 
 } AudioDevice;
 
-typedef struct AudioResamlpe
+typedef struct AudioResample
 {
     AVFrame *frame;
     struct SwrContext *swr_ctx;
-} AudioResamlpe;
+} AudioResample;
 
 typedef struct PacketQueue
 {
@@ -119,7 +119,7 @@ static Decoder audio_decoder;
 static Decoder video_decoder;
 
 static AudioDevice audio_device;
-static AudioResamlpe audio_resample;
+static AudioResample audio_resample;
 
 int8_t audio_buffer[AUDIO_BUFFER_SIZE];
 static unsigned int audio_buffer_index = 0;
@@ -141,6 +141,60 @@ static double frame_timer = 0.0;
 
 static SDL_Thread *parse_container_thread = NULL;
 static SDL_Thread *decode_video_thread = NULL;
+
+static bool init_media_container(MediaContainer *media_container, const char *filename);
+static void release_media_container(MediaContainer *media_container);
+
+static bool init_audio_decoder(Decoder *decoder, AVStream *stream);
+static bool init_video_decoder(Decoder *decoder, AVStream *stream);
+static void release_decoder(Decoder *decoder);
+
+static bool init_audio_device(AudioDevice *device);
+static void release_audio_device(AudioDevice *device);
+
+static bool init_audio_resample(AudioResample *resample,
+                                int in_channel_count, int out_channel_count,
+                                int in_sample_format, int out_sample_format,
+                                int in_channel_layout, int out_channel_layout,
+                                int in_sample_rate, int out_sample_rate);
+static void release_audio_resample(AudioResample *resample);
+
+static bool init_video_device(VideoDevice *device, int xorig, int yorig, int width, int height);
+static void release_video_device(VideoDevice *device);
+
+static bool init_video_rescale(VideoRescale *rescale,
+                               int in_width, int in_height, int in_format,
+                               int out_width, int out_height, int out_format);
+static void release_video_rescale(VideoRescale *rescale);
+
+static bool packet_queue_init(PacketQueue *queue);
+static bool packet_queue_put(PacketQueue *queue, const AVPacket *packet);
+static int packet_queue_get(PacketQueue *queue, AVPacket *packet, bool block);
+static void packet_queue_destroy(PacketQueue *queue);
+
+static bool picture_queue_init(PictureQueue *queue);
+static bool picture_queue_put_frame(PictureQueue *queue, const AVFrame *frame, double pts);
+static void picture_queue_peek(PictureQueue *queue, Picture **picture);
+static bool picture_queue_consume(PictureQueue *queue);
+static void picture_queue_destroy(PictureQueue *queue);
+
+static double get_audio_clock(void);
+
+static void picture_display(const Picture *picture);
+
+static int decode_audio(void *userdata, uint8_t *audio_buffer, int buffer_size);
+
+static void audio_callback(void *userdata, Uint8 *stream, int length);
+
+static void refresh_screen(void);
+
+static void schedule_screen_refresh(Uint32 delay_ms);
+
+static void synchronize_video(const AVFrame *frame, double pts);
+
+/* Thread functions */
+static int parse_container(void *userdata);
+static int decode_video(void *userdata);
 
 // 初始化媒体容器
 static bool init_media_container(MediaContainer *media_container, const char *filename)
@@ -441,7 +495,7 @@ static void release_audio_device(AudioDevice *device)
     device->id = -1;
 }
 
-static bool init_audio_resample(AudioResamlpe *resample,
+static bool init_audio_resample(AudioResample *resample,
                                 int in_channel_count, int out_channel_count,
                                 int in_sample_format, int out_sample_format,
                                 int in_channel_layout, int out_channel_layout,
@@ -480,7 +534,7 @@ static bool init_audio_resample(AudioResamlpe *resample,
     return true;
 }
 
-static void release_audio_resample(AudioResamlpe *resample)
+static void release_audio_resample(AudioResample *resample)
 {
     assert(resample != NULL);
     if (resample->frame != NULL)
@@ -616,7 +670,7 @@ static bool picture_queue_init(PictureQueue *queue)
     return true;
 }
 
-static bool packet_queue_init(PacketQueue *queue, const AVPacket *packet)
+static bool packet_queue_put(PacketQueue *queue, const AVPacket *packet)
 {
     assert(queue != NULL);
 
@@ -659,6 +713,59 @@ static bool packet_queue_init(PacketQueue *queue, const AVPacket *packet)
         return false;
     }
     return true;
+}
+
+static int packet_queue_get(PacketQueue *queue, AVPacket *pkt, bool block)
+{
+    assert(queue != NULL);
+
+    if (SDL_LockMutex(queue->mutex) != 0)
+    {
+        fprintf(stderr, "SDL_LockMutex() error: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    AVPacketList *pktl = NULL;
+    int ret = 0;
+    for (;;)
+    {
+        if (finished)
+        {
+            break;
+        }
+        pktl = queue->first_packet;
+        if (pktl)
+        {
+            queue->first_packet = pktl->next;
+            if (!queue->first_packet)
+                queue->last_packet = NULL;
+            queue->num_of_packets--;
+            queue->num_of_bytes -= pktl->pkt.size;
+            *pkt = pktl->pkt;
+            av_free(pktl);
+            ret = 1;
+            break;
+        }
+        else if (!block)
+        {
+            break;
+        }
+        else
+        {
+            if (SDL_CondWait(queue->cond, queue->mutex != 0))
+            {
+                fprintf(stderr, "SDL_CondWait() error:%s\n", SDL_GetError());
+                ret = -1;
+                break;
+            }
+        }
+    }
+    if (SDL_UnlockMutex(queue->mutex) != 0)
+    {
+        fprintf(stderr, "SDL_UnlockMutex() error: %s\n", SDL_GetError());
+        ret = -1;
+    }
+    return ret;
 }
 
 static uint32_t on_refresh_screen_timer(uint32_t interval, void *param)
@@ -721,8 +828,61 @@ static int parse_container(void *userdata)
 
 parse_fail:
     event.type = QUIT_EVENT;
+    if (SDL_PushEvent(&event) < 0)
+        fprintf(stderr, "SDL_PushEvent() failed:%s\n", SDL_GetError());
 
 parse_end:
+    return 0;
+}
+
+static int decode_video(void *userdata)
+{
+    AVCodecContext *codec_ctx = video_decoder.codec_ctx;
+    assert(codec_ctx != NULL);
+
+    AVFrame *frame = av_frame_alloc();
+
+    if (!frame)
+    {
+        fprintf(stderr, "Could not allocate video frame\n");
+        return -1;
+    }
+    AVPacket packet;
+    SDL_Event event;
+    for (;;)
+    {
+        if (finished)
+            break;
+        int ret = packet_queue_get(&video_queue, &packet, true);
+        if (ret == -1)
+        {
+            fprintf(stderr, "Could not get video packet! - an error\n");
+            goto decode_video_fail;
+        }
+        else if (ret == 0)
+        {
+            fprintf(stderr, "Could not get video packet! - no data\n");
+            goto decode_video_fail;
+        }
+
+        ret = avcodec_send_packet(codec_ctx, &packet);
+        if (ret < 0)
+        {
+            fprintf(stderr, "Error sending packet (%s)\n", av_err2str(ret));
+            goto decode_video_fail;
+        }
+        while (ret > 0)
+        {
+        }
+    }
+    goto decode_video_end;
+
+decode_video_fail:
+    event.type = QUIT_EVENT;
+    if (SDL_PushEvent(&event) < 0)
+        fprintf(stderr, "SDL_PushEvent() failed:%s\n", SDL_GetError());
+
+decode_video_end:
     return 0;
 }
 
@@ -821,7 +981,18 @@ int main(int argc, char *argv[])
     schedule_screen_refresh(40);
 
     parse_container_thread = SDL_CreateThread(parse_container, "parse container", NULL);
+    if (!parse_container_thread)
+    {
+        fprintf(stderr, "SDL_CreateThread() error: %s\n", SDL_GetError());
+        goto end;
+    }
 
+    decode_video_thread = SDL_CreateThread(decode_video, "decode video", NULL);
+    if (!decode_video_thread)
+    {
+        fprintf(stderr, "SDL_CreateThread() error: %s\n", SDL_GetError());
+        goto end;
+    }
 end:
     // 退出SDL
     SDL_Quit();

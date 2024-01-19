@@ -11,3 +11,6 @@
 *.la
 *.a
 
+# Executables
+*.out
+

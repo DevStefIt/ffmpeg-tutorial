@@ -1,0 +1,9 @@
+{
+    "makefile.launchConfigurations": [
+        {
+            "cwd": "$HOME/ffmpeg-tutorial/bin",
+            "binaryPath": "$HOME/ffmpeg-tutorial/bin/tutorial01.out",
+            "binaryArgs": []
+        }
+    ]
+}

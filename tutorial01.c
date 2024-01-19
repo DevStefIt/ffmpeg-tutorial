@@ -217,11 +217,9 @@ int main(int argc, char *argv[]) {
           );
           sws_freeContext(swsCtx);
 
-          for (;i < frames_to_process; ++i)
-          {
-	          // Save the frame to disk
-	          saveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i);
-          }
+          
+	        // Save the frame to disk
+	        saveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, ++i);
         }
       }
     }

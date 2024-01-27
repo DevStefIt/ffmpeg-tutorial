@@ -28,198 +28,250 @@
 #include <stdio.h>
 
 #undef main
-int main(int argc, char *argv[]) {
-    AVFormatContext *pFormatCtx = NULL;
-    int             i, videoStream;
-    AVCodecContext  *pCodecCtx = NULL;
-    AVCodec         *pCodec = NULL;
-    AVFrame         *pFrame = NULL;
-    AVFrame         *pFrameYUV = NULL;
-    AVPacket        packet;
-    int             frameFinished;
-    //float           aspect_ratio;
+int main(int argc, char *argv[])
+{
+  if (argc < 2)
+  {
+      fprintf(stderr, "Please provide a movie file\n");
+      exit(1);
+  }
 
-    AVDictionary    *optionsDict = NULL;
-    struct SwsContext *sws_ctx = NULL;
-    SDL_Window      *window;
-    SDL_Renderer    *renderer;
-    SDL_Texture     *texture;
-    SDL_Rect        rect;
-    SDL_Event       event;
+  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER))
+  {
+      fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
+      exit(1);
+  }
 
-    if(argc < 2) {
-        fprintf(stderr, "Usage: test <file>\n");
-        exit(1);
+  // Open video file
+  AVFormatContext *pFormatCtx = avformat_alloc_context();
+  if (!pFormatCtx)
+  {
+      fprintf(stderr, "Could not allocate memory for format context");
+      return -1;
+  }
+
+  if (avformat_open_input(&pFormatCtx, argv[1], NULL, NULL) != 0)
+  {
+      fprintf(stderr, "Cannot open file");
+      return -1;
+  }
+
+  // Retrieve stream information
+  if (avformat_find_stream_info(pFormatCtx, NULL) < 0)
+  {
+    fprintf(stderr, "Could not find stream information");
+    return -1; // Couldn't find stream information
+  }
+
+  AVCodec *pCodec = NULL;
+  AVCodecParameters *pCodecParams = NULL;
+
+  // Find the first video stream
+  int videoStream = -1;
+  int i;
+
+  for (i = 0; i < pFormatCtx->nb_streams; i++)
+  {
+    if (pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+    {
+      videoStream = i;
+      pCodecParams = pFormatCtx->streams[i]->codecpar;
+      pCodec = avcodec_find_decoder(pCodecParams->codec_id);
+      break; // We want only the first video stream, the leave the other stream that might be present in the file
     }
-    // Register all formats and codecs
-    av_register_all();
+  }
 
-    if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
-        fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
-        exit(1);
-    }
+  // Get a pointer to the codec context for the video stream
+  AVCodecContext *pCodecCtx = avcodec_alloc_context3(pCodec);
+  if (pCodecCtx == NULL)
+  {
+    fprintf(stderr, "Could not allocate video codec context");
+    return -1;
+  }
 
-    // Open video file
-    if(avformat_open_input(&pFormatCtx, argv[1], NULL, NULL)!=0)
-        return -1; // Couldn't open file
+  // Fill the codec context from the codec parameters values
+  if (avcodec_parameters_to_context(pCodecCtx, pCodecParams) < 0)
+  {
+    fprintf(stderr, "Failed to copy codec params to codec context");
+    return -1;
+  }
 
-    // Retrieve stream information
-    if(avformat_find_stream_info(pFormatCtx, NULL)<0)
-        return -1; // Couldn't find stream information
+  if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0)
+  {
+    fprintf(stderr, "failed to open codec");
+    return -1;
+  }
 
-    // Dump information about file onto standard error
-    av_dump_format(pFormatCtx, 0, argv[1], 0);
+  // Allocate video frame
+  AVFrame *pFrame = av_frame_alloc();
+  if (pFrame == NULL)
+  {
+    fprintf(stderr, "Could not allocate video frame");
+    return -1;
+  }
 
-    // Find the first video stream
-    videoStream=-1;
-    for(i=0; i<pFormatCtx->nb_streams; i++)
-        if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
-            videoStream=i;
-            break;
+  AVPacket *pPacket = av_packet_alloc();
+  if (pPacket == NULL)
+  {
+    fprintf(stderr, "Failed to allocate memory for AVPacket");
+    return -1;
+  }
+
+  AVFrame *pFrameYUV = av_frame_alloc();
+  if(pFrameYUV == NULL)
+  {
+    fprintf(stderr, "Could not allocate output video frame");
+    return -1;
+  }
+
+  // Make a screen to put our video
+  // #ifndef __DARWIN__
+  //     screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
+  // #else
+  //     screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 24, 0);
+  // #endif
+  //     if (!screen)
+  //     {
+  //         fprintf(stderr, "SDL: could not set video mode - exiting\n");
+  //         exit(1);
+  //     }
+
+  SDL_Window *window = SDL_CreateWindow("tutorial02", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, pCodecCtx->width, pCodecCtx->height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+
+  if (!window)
+  {
+      fprintf(stderr, "SDL: could not create SDL window - %s exiting\n", SDL_GetError());
+      exit(1);
+  }
+
+  SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 0);
+  SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, pCodecCtx->width, pCodecCtx->height);
+  SDL_Rect rect;
+  SDL_Event event;
+  // Allocate a place to put our YUV image on that screen
+  // bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
+  //                            pCodecCtx->height,
+  //                            SDL_YV12_OVERLAY,
+  //                            screen);
+
+  struct SwsContext *swsCtx =
+      sws_getContext
+      (
+          pCodecCtx->width,
+          pCodecCtx->height,
+          pCodecCtx->pix_fmt,
+          pCodecCtx->width,
+          pCodecCtx->height,
+          AV_PIX_FMT_YUV420P,
+          SWS_BILINEAR,
+          NULL,
+          NULL,
+          NULL
+      );
+
+  // Read frames and save first five frames to disk
+  i = 0;
+  while(av_read_frame(pFormatCtx, pPacket) >=0 )
+  {
+    // Is this a packet from the video stream?
+    if (pPacket->stream_index == videoStream)
+    {
+      // Decode video frame  
+      if (avcodec_send_packet(pCodecCtx, pPacket) < 0)
+      {
+        fprintf(stderr, "Error while sending packet to decoder.");
+        return -1;
+      }
+
+      int frameFinished = 1;
+      // Did we get a video frame?
+      if (frameFinished >= 0)
+      {
+        frameFinished = avcodec_receive_frame(pCodecCtx, pFrame);
+        // These two return values are special and mean there is no output
+        // frame available, but there were no errors during decoding
+        if (frameFinished == AVERROR(EAGAIN) || frameFinished == AVERROR_EOF)
+        {
+          break;
         }
-    if(videoStream==-1)
-        return -1; // Didn't find a video stream
-
-    // Get a pointer to the codec context for the video stream
-    pCodecCtx=pFormatCtx->streams[videoStream]->codec;
-
-    // Find the decoder for the video stream
-    pCodec=avcodec_find_decoder(pCodecCtx->codec_id);
-    if(pCodec==NULL) {
-        fprintf(stderr, "Unsupported codec!\n");
-        return -1; // Codec not found
-    }
-
-    // Open codec
-    if(avcodec_open2(pCodecCtx, pCodec, &optionsDict)<0)
-        return -1; // Could not open codec
-
-    // Allocate video frame
-    pFrame=av_frame_alloc();
-    pFrameYUV=av_frame_alloc();
-
-    av_image_fill_arrays(
-        pFrameYUV->data,
-        pFrameYUV->linesize,
-        (uint8_t const *const *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height, 1)),
-        AV_PIX_FMT_YUV420P,
-        pCodecCtx->width,
-        pCodecCtx->height,
-        1);
-    // Make a screen to put our video
-    // #ifndef __DARWIN__
-    //     screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
-    // #else
-    //     screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 24, 0);
-    // #endif
-    //     if (!screen)
-    //     {
-    //         fprintf(stderr, "SDL: could not set video mode - exiting\n");
-    //         exit(1);
-    //     }
-
-    window = SDL_CreateWindow("tutorial02", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, pCodecCtx->width, pCodecCtx->height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-
-    if(!window) {
-        fprintf(stderr, "SDL: could not create SDL window - %s exiting\n", SDL_GetError());
-        exit(1);
-    }
-
-    renderer = SDL_CreateRenderer(window, -1, 0);
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, pCodecCtx->width, pCodecCtx->height);
-    // Allocate a place to put our YUV image on that screen
-    // bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
-    //                            pCodecCtx->height,
-    //                            SDL_YV12_OVERLAY,
-    //                            screen);
-
-    sws_ctx =
-        sws_getContext
-        (
-            pCodecCtx->width,
-            pCodecCtx->height,
-            pCodecCtx->pix_fmt,
-            pCodecCtx->width,
-            pCodecCtx->height,
-            AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR,
-            NULL,
-            NULL,
-            NULL
-        );
-
-    // Read frames and save first five frames to disk
-    i=0;
-    while(av_read_frame(pFormatCtx, &packet)>=0) {
-        // Is this a packet from the video stream?
-        if(packet.stream_index==videoStream) {
-            // Decode video frame
-            avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished,
-                                  &packet);
-
-            // Did we get a video frame?
-            if(frameFinished) {
-                // SDL_LockYUVOverlay(bmp);
-
-                // AVPicture pict;
-                // pict.data[0] = bmp->pixels[0];
-                // pict.data[1] = bmp->pixels[2];
-                // pict.data[2] = bmp->pixels[1];
-
-                // pict.linesize[0] = bmp->pitches[0];
-                // pict.linesize[1] = bmp->pitches[2];
-                // pict.linesize[2] = bmp->pitches[1];
-
-                // Convert the image into YUV format that SDL uses
-                sws_scale
-                (
-                    sws_ctx,
-                    (uint8_t const * const *)pFrame->data,
-                    pFrame->linesize,
-                    0,
-                    pCodecCtx->height,
-                    pFrameYUV->data,
-                    pFrameYUV->linesize
-                );
-
-                // SDL_UnlockYUVOverlay(bmp);
-
-                rect.x = 0;
-                rect.y = 0;
-                rect.w = pCodecCtx->width;
-                rect.h = pCodecCtx->height;
-                // SDL_DisplayYUVOverlay(bmp, &rect);
-                SDL_UpdateTexture(texture, NULL, pFrameYUV->data[0], pFrameYUV->linesize[0]);
-                SDL_RenderClear(renderer);
-                SDL_RenderCopy(renderer, texture, NULL, &rect);
-                SDL_RenderPresent(renderer);
-            }
+        else if (frameFinished < 0)
+        {
+          fprintf(stderr, "Error during decoding");
+          return -1;
         }
+        // SDL_LockYUVOverlay(bmp);
 
-        // Free the packet that was allocated by av_read_frame
-        av_free_packet(&packet);
-        SDL_PollEvent(&event);
-        switch(event.type) {
+        // AVPicture pict;
+        // pict.data[0] = bmp->pixels[0];
+        // pict.data[1] = bmp->pixels[2];
+        // pict.data[2] = bmp->pixels[1];
+
+        // pict.linesize[0] = bmp->pitches[0];
+        // pict.linesize[1] = bmp->pitches[2];
+        // pict.linesize[2] = bmp->pitches[1];
+
+        // Convert the image into YUV format that SDL uses
+        if (frameFinished >= 0)
+        {
+          if (av_image_alloc(pFrameYUV->data, pFrameYUV->linesize, pCodecCtx->width, pCodecCtx->height, AV_PIX_FMT_YUV420P, 1) < 0)
+          {
+            fprintf(stderr, "Could not allocate output frame");
+            return -1;
+          }
+
+          // Convert the image from its native format to RGB
+          sws_scale
+          (
+              swsCtx,
+              pFrame->data,
+              pFrame->linesize,
+              0,
+              pCodecCtx->height,
+              pFrameYUV->data,
+              pFrameYUV->linesize
+          );
+
+         // SDL_UnlockYUVOverlay(bmp);
+
+          rect.x = 0;
+          rect.y = 0;
+          rect.w = pCodecCtx->width;
+          rect.h = pCodecCtx->height;
+          // SDL_DisplayYUVOverlay(bmp, &rect);
+
+          SDL_UpdateTexture(texture, NULL, pFrameYUV->data[0], pFrameYUV->linesize[0]);
+          SDL_RenderClear(renderer);
+          SDL_RenderCopy(renderer, texture, NULL, &rect);
+          SDL_RenderPresent(renderer);
+        }
+      }
+
+      // Free the packet that was allocated by av_read_frame
+      av_packet_unref(pPacket);
+      SDL_PollEvent(&event);
+      switch(event.type)
+      {
         case SDL_QUIT:
             SDL_Quit();
             exit(0);
             break;
         default:
             break;
-        }
-
+      }
     }
+  }
 
-    sws_freeContext(sws_ctx);
-    // Free the YUV frame
-    av_free(pFrame);
-    av_free(pFrameYUV);
+  sws_freeContext(swsCtx);
 
-    // Close the codec
-    avcodec_close(pCodecCtx);
+  // Free the YUV frame
+  av_frame_free(&pFrame);
+  av_frame_free(&pFrameYUV);
 
-    // Close the video file
-    avformat_close_input(&pFormatCtx);
+  // Close the codec
+  avcodec_free_context(&pCodecCtx);
 
-    return 0;
+  // Close the video file
+  avformat_close_input(&pFormatCtx);
+
+  return 0;
 }

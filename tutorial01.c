@@ -49,7 +49,8 @@ void saveFrame(AVFrame *pFrame, int width, int height, int iFrame)
   fclose(pFile);
 }
 
-int main(int argc, char *argv[]) {  
+int main(int argc, char *argv[])
+{  
   if (argc < 2)
   {
     printf("Please provide a movie file\n");
@@ -148,6 +149,21 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  struct SwsContext *swsCtx =
+    sws_getContext
+    (
+        pCodecCtx->width,
+        pCodecCtx->height,
+        pCodecCtx->pix_fmt,
+        pCodecCtx->width,
+        pCodecCtx->height,
+        AV_PIX_FMT_RGB24,
+        SWS_BILINEAR,
+        NULL,
+        NULL,
+        NULL
+    );
+
   int frames_to_process = 5;
   i = 0;
   
@@ -189,21 +205,6 @@ int main(int argc, char *argv[]) {
             return -1;
           }
 
-          struct SwsContext *swsCtx =
-          sws_getContext
-          (
-              pCodecCtx->width,
-              pCodecCtx->height,
-              pCodecCtx->pix_fmt,
-              pCodecCtx->width,
-              pCodecCtx->height,
-              AV_PIX_FMT_RGB24,
-              SWS_BILINEAR,
-              NULL,
-              NULL,
-              NULL
-          );
-
           // Convert the image from its native format to RGB
           sws_scale
           (
@@ -215,8 +216,6 @@ int main(int argc, char *argv[]) {
               pFrameRGB->data,
               pFrameRGB->linesize
           );
-          sws_freeContext(swsCtx);
-
           
 	        // Save the frame to disk
 	        saveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, ++i);
@@ -227,6 +226,8 @@ int main(int argc, char *argv[]) {
     // Free the packet that was allocated by av_read_frame
     av_packet_unref(pPacket);
   }
+
+  sws_freeContext(swsCtx);
 
   // Free the YUV frame
   av_frame_free(&pFrame);

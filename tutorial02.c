@@ -169,8 +169,6 @@ int main(int argc, char *argv[])
           NULL
       );
 
-  // Read frames and save first five frames to disk
-  i = 0;
   while(av_read_frame(pFormatCtx, pPacket) >=0 )
   {
     // Is this a packet from the video stream?

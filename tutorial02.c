@@ -148,11 +148,6 @@ int main(int argc, char *argv[])
   SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, pCodecCtx->width, pCodecCtx->height);
   SDL_Rect rect;
   SDL_Event event;
-  // Allocate a place to put our YUV image on that screen
-  // bmp = SDL_CreateYUVOverlay(pCodecCtx->width,
-  //                            pCodecCtx->height,
-  //                            SDL_YV12_OVERLAY,
-  //                            screen);
 
   struct SwsContext *swsCtx =
       sws_getContext
@@ -197,16 +192,6 @@ int main(int argc, char *argv[])
           fprintf(stderr, "Error during decoding");
           return -1;
         }
-        // SDL_LockYUVOverlay(bmp);
-
-        // AVPicture pict;
-        // pict.data[0] = bmp->pixels[0];
-        // pict.data[1] = bmp->pixels[2];
-        // pict.data[2] = bmp->pixels[1];
-
-        // pict.linesize[0] = bmp->pitches[0];
-        // pict.linesize[1] = bmp->pitches[2];
-        // pict.linesize[2] = bmp->pitches[1];
 
         // Convert the image into YUV format that SDL uses
         if (frameFinished >= 0)

@@ -98,7 +98,7 @@ int main(int argc, char *argv[])
 
   if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0)
   {
-    fprintf(stderr, "failed to open codec");
+    fprintf(stderr, "Failed to open codec");
     return -1;
   }
 
